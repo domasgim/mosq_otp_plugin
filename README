@@ -1,0 +1,7 @@
+# Mosquitto OTP authentication plugin
+
+TODO
+
+## Sample commands
+
+The mosquitto commands such as mosquitto_pub do not support AUTH properties!
