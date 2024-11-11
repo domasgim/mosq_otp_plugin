@@ -191,6 +191,7 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata,
 {
 	mosq_pid = identifier;
 	cotp_error_t cotp_err;
+	char *err_msg			    = NULL;
 
 	g_secret_base32 = base32_encode((const uchar *)g_secret,
 					strlen(g_secret) + 1, &cotp_err);
@@ -200,18 +201,23 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata,
 	}
 
 	if (sqlite3_open(DB_PATH, &g_db)) {
-		mosquitto_log_printf(MOSQ_LOG_INFO, "Failed to open database '%s'", DB_PATH);
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to open database '%s'", DB_PATH);
 		return MOSQ_ERR_CONN_REFUSED;
 	} else {
 		mosquitto_log_printf(MOSQ_LOG_INFO, "Opened database '%s'", DB_PATH);
 	}
 
-	if (sqlite3_exec(g_db, DB_CREATE_FMT, NULL, NULL, &err_msg) != SQLITE_OK) {
-		log(L_ERROR, "Failed creating table error '%s'", err_msg);
+	if (sqlite3_exec(g_db, DB_CREATE_DEVICES_FMT, NULL, NULL, &err_msg) != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed creating device table error '%s'", err_msg);
 		sqlite3_free(err_msg);
-		return URCD_ERROR;
+		return MOSQ_ERR_CONN_REFUSED;
 	}
 
+	if (sqlite3_exec(g_db, DB_CREATE_CRP_FMT, NULL, NULL, &err_msg) != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed creating CRP table error '%s'", err_msg);
+		sqlite3_free(err_msg);
+		return MOSQ_ERR_CONN_REFUSED;
+	}
 
 	mosquitto_log_printf(MOSQ_LOG_INFO, "mosquitto_plugin_init %d",
 			     option_count);
