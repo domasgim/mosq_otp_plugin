@@ -5,6 +5,7 @@
 #include <string.h>
 #include <cotp.h>
 #include <cjson/cJSON.h>
+#include <sqlite3.h>
 
 const char *g_secret = "my_awesome_secret";
 char *g_secret_base32 = NULL;
@@ -12,6 +13,63 @@ int g_counter = 2;
 
 // MOSQ_ERR_AUTH_CONTINUE
 static mosquitto_plugin_id_t *mosq_pid = NULL;
+sqlite3 *g_db;
+
+
+typedef enum { AC_SUCCESS, AC_ERROR } ac_stat;
+
+#define DB_PATH	   "/tmp/mosq_otp_plugin.db"
+#define DB_TABLE   "REGISTERED_DEVICES"
+#define DB_TIMEOUT 5000
+// #define DB_CREATE_FMT                                                                                        \
+	// "CREATE TABLE IF NOT EXISTS " DB_TABLE                                                               \
+	// "(ID INTEGER PRIMARY KEY AUTOINCREMENT, MAC CHAR(15), SIM_SLOT INTEGER, "                       \
+	// "SENT INTEGER, RECEIVED INTEGER)"
+
+#define DB_CREATE_DEVICES_FMT                                                                                \
+	"CREATE TABLE IF NOT EXISTS Devices (ID INTEGER PRIMARY KEY AUTOINCREMENT,"                          \
+	"MAC CHAR(17) UNIQUE NOT NULL)"
+
+#define DB_CREATE_CRP_FMT                                                                                    \
+	"CREATE TABLE IF NOT EXISTS ChallengeResponsePairs ("                                                \
+	"DeviceID INTEGER,"                                                                                  \
+	"Challenge INTEGER,"                                                                                 \
+	"Response INTEGER,"                                                                                  \
+	"FOREIGN KEY (DeviceID) REFERENCES Devices(ID)"                                                      \
+	")"
+
+#define DB_CHECK_DEVICE_FMT                                                                                  \
+	"SELECT MAC FROM Devices WHERE MAC = ?"
+
+#define DB_INSERT_DEVICE_FMT                                                                                 \
+	"INSERT INTO Devices (MAC) VALUES (?)"
+
+#define DB_INSERT_CRP_FMT                                                                                    \
+	"INSERT INTO ChallengeResponsePairs (DeviceID, Challenge, Response) VALUES (?, ?, ?)"
+
+static ac_stat parse_device_mac(char *json_str, char **out)
+{
+	const cJSON *device_mac = NULL;
+	cJSON *parsed_json = cJSON_Parse(json_str);
+	if (parsed_json == NULL) {
+		const char *error_ptr = cJSON_GetErrorPtr();
+		if (error_ptr != NULL) {
+			mosquitto_log_printf(MOSQ_LOG_INFO, "Error before: %s\n", error_ptr);
+		}
+		return AC_ERROR;
+	}
+
+	device_mac = cJSON_GetObjectItemCaseSensitive(parsed_json, "DEVICE_MAC");
+	if (cJSON_IsString(device_mac) && (device_mac->valuestring != NULL)) {
+		*out = strdup(device_mac->valuestring);
+		cJSON_Delete(parsed_json);
+		return AC_SUCCESS;
+	} else {
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Failed to find 'DEVICE_MAC'!\n");
+		cJSON_Delete(parsed_json);
+		return AC_ERROR;
+	}
+}
 
 int auth_start_cb(int event, void *event_data, void *user_data)
 {
@@ -19,12 +77,22 @@ int auth_start_cb(int event, void *event_data, void *user_data)
 	char *auth_data = NULL;
 	char *out_data = "{\"hotp_counter\":2}";
 
-	// mosquitto_property_read_string(&ed->properties, MQTT_PROP_AUTHENTICATION_DATA, &auth_data, false);
+	// ed->data_out = strdup(out_data);
+	// ed->data_out_len = strlen(out_data);
 
-	// mosquitto_property_add_string(&ed->properties, MQTT_PROP_AUTHENTICATION_DATA, "{\"hello\":\"world\"}");
+	if (ed->data_in_len > 0) {
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Got some data of len %d: '%s'",
+				     ed->data_in_len, ed->data_in);
+	} else {
+		mosquitto_log_printf(MOSQ_LOG_INFO, "No data in\n");
+		return MOSQ_ERR_AUTH;
+	}
 
-	ed->data_out = strdup(out_data);
-	ed->data_out_len = strlen(out_data);
+	if (parse_device_mac((char *)ed->data_in, &auth_data) != AC_SUCCESS) {
+		return MOSQ_ERR_AUTH;
+	}
+
+	mosquitto_log_printf(MOSQ_LOG_INFO, "Parsed device MAC: '%s'", auth_data);
 
 	mosquitto_log_printf(
 		MOSQ_LOG_INFO,
@@ -130,6 +198,20 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata,
 	if (cotp_err != 0) {
 		// TODO handle
 	}
+
+	if (sqlite3_open(DB_PATH, &g_db)) {
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Failed to open database '%s'", DB_PATH);
+		return MOSQ_ERR_CONN_REFUSED;
+	} else {
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Opened database '%s'", DB_PATH);
+	}
+
+	if (sqlite3_exec(g_db, DB_CREATE_FMT, NULL, NULL, &err_msg) != SQLITE_OK) {
+		log(L_ERROR, "Failed creating table error '%s'", err_msg);
+		sqlite3_free(err_msg);
+		return URCD_ERROR;
+	}
+
 
 	mosquitto_log_printf(MOSQ_LOG_INFO, "mosquitto_plugin_init %d",
 			     option_count);

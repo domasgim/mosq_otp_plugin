@@ -160,7 +160,7 @@ static int on_ext_auth(struct mosquitto *mosq, void *obj,
 
 	char *hotp_json_string = NULL;
 	hotp_json_string = cJSON_Print(hotp_json);
-	
+
 	printf("Adding reply: '%s'\n", hotp_json_string);
 
         cJSON_Delete(parsed_hotp_json);
