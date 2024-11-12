@@ -10,6 +10,7 @@
 
 typedef enum { AC_SUCCESS, AC_ERROR } ac_stat;
 
+#define PUF_SCRIPT_PATH "/home/net-gimzunasdo/Stuff/baigiamasis/mosq_otp_plugin/pypuf_simulator/main.py"
 #define MOCK_MAC    "00:00:00:00:00:00"
 #define HOTP_METHOD "KTU-HOTP-AUTH"
 
@@ -37,6 +38,150 @@ static void ac_on_publish(struct mosquitto *mosq, void *obj, int mid, int flags,
 	fprintf(stdout, "Message with mid %d has been published.\n", mid);
 }
 
+static ac_stat ac_run_python_puf_script(int *challenge, int array_count, char **out)
+{
+        FILE *fp;
+        char path[1035];
+        char command[256];
+
+        if (array_count != 32) {
+                fprintf(stderr, "Error: Challenge array count is not 32\n");
+                return AC_ERROR;
+        }
+
+        // Don't ask
+        snprintf(command, sizeof(command), "python3.10 %s %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
+                 PUF_SCRIPT_PATH,
+                 challenge[0], challenge[1], challenge[2], challenge[3], challenge[4], challenge[5], challenge[6], challenge[7], 
+                 challenge[8], challenge[9], challenge[10], challenge[11], challenge[12], challenge[13], challenge[14], challenge[15], 
+                 challenge[16], challenge[17], challenge[18], challenge[19], challenge[20], challenge[21], challenge[22], challenge[23], 
+                 challenge[24], challenge[25], challenge[26], challenge[27], challenge[28], challenge[29], challenge[30], challenge[31]);
+
+
+        /* Open the command for reading. */
+        fp = popen(command, "r");
+        if (fp == NULL) {
+                fprintf(stderr, "Failed to run command\n");
+                return AC_ERROR;
+        }
+
+        /* Read the output a line at a time - output it. */
+        while (fgets(path, sizeof(path), fp) != NULL) {
+                *out = strdup(path);
+        }
+
+        /* close */
+        pclose(fp);
+
+        return AC_SUCCESS;
+}
+
+static ac_stat ac_generate_challenge_response_pairs(const cJSON *registration_challenges, char **out)
+{
+	cJSON *challenge = NULL;
+        const int challenge_count = 32;
+        int challenge_int[challenge_count];
+        int i = 0;
+	cJSON_ArrayForEach(challenge, registration_challenges)
+	{
+		if (cJSON_IsNumber(challenge)) {
+			fprintf(stdout, "Received challenge: %d\n", challenge->valueint);
+                        challenge_int[i] = challenge->valueint;
+                        i++;
+                        // TODO run python script to generate the response
+                        // Get the python output and append to new JSON array, lastly print the array contents to string
+		}
+	}
+
+        char *response = NULL;
+        if (ac_run_python_puf_script(challenge_int, challenge_count, &response) == AC_ERROR) {
+                return AC_ERROR;
+        }
+
+        fprintf(stdout, "Received response: %s\n", response);
+
+        cJSON *response_json = cJSON_CreateObject();
+        if (response_json == NULL) {
+                fprintf(stderr, "Error: Could not create JSON object\n");
+                return AC_ERROR;
+        }
+
+        if (cJSON_AddNumberToObject(response_json, "CHALLENGE_RESPOSNE", atoi(response)) == NULL) {
+                fprintf(stderr, "Error: Could not add string to JSON object\n");
+                cJSON_Delete(response_json);
+                return AC_ERROR;
+        }
+
+        if (cJSON_AddStringToObject(response_json, "DEVICE_MAC", MOCK_MAC) == NULL) {
+		fprintf(stderr, "Error: Could not add string to JSON object\n");
+                cJSON_Delete(response_json);
+		// ret = AC_ERROR;
+		// goto out;
+	}
+
+        if (cJSON_AddNumberToObject(response_json, "REASON", 1) == NULL) { // reson of 1 means update responses in the database
+		fprintf(stderr, "Error: Could not add string to JSON object\n");
+                cJSON_Delete(response_json);
+		// ret = AC_ERROR;
+		// goto out;
+	}
+
+        char *response_str = cJSON_PrintUnformatted(response_json);
+        if (response_str == NULL) {
+                fprintf(stderr, "Error: Could not print JSON object\n");
+                cJSON_Delete(response_json);
+                return AC_ERROR;
+        } else {
+                fprintf(stdout, "Generated response: '%s'\n", response_str);
+        }
+
+        *out = response_str;
+        cJSON_Delete(response_json);
+
+        return AC_SUCCESS;
+}
+
+static ac_stat ac_parse_auth_continue_payload(char *auth_data, char **out)
+{
+	cJSON *parsed_json = cJSON_Parse(auth_data);
+	if (parsed_json == NULL) {
+		const char *error_ptr = cJSON_GetErrorPtr();
+		if (error_ptr != NULL) {
+			fprintf(stderr, "Error before: %s\n", error_ptr);
+		}
+		return AC_ERROR;
+	}
+
+	const cJSON *registration_challenges = cJSON_GetObjectItem(parsed_json, "challenges");
+	if (cJSON_IsArray(registration_challenges)) {
+		if (ac_generate_challenge_response_pairs(registration_challenges, out) == AC_ERROR) {
+                        return AC_ERROR;
+                }
+
+                if (*out != NULL) {
+                        fprintf(stdout, "Received PUF response: '%s'\n", *out);
+                } else {
+                        fprintf(stderr, "Did not receive PUF response!\n");
+                        return AC_ERROR;
+                }
+	} else {
+		fprintf(stdout, "Did not receive challenges!\n");
+	}
+
+	// const cJSON *hotp_local = cJSON_GetObjectItem(parsed_json, "hotp_local");
+	// if (cJSON_IsString(hotp_local) && (hotp_local->valuestring != NULL)) {
+	//         fprintf(stdout, "Received HOTP local: '%s'\n", hotp_local->valuestring);
+	// } else {
+	//         fprintf(stderr, "Did not receive HOTP local, exiting!\n");
+	//         return AC_ERROR;
+	// }
+
+	// *out = cJSON_PrintUnformatted(parsed_json);
+	// cJSON_Delete(parsed_json);
+
+	return AC_SUCCESS;
+}
+
 static int ac_on_ext_auth(struct mosquitto *mosq, void *obj, const char *auth_method, uint16_t auth_data_len,
 			  const void *auth_data, const mosquitto_property *properties)
 {
@@ -47,9 +192,16 @@ static int ac_on_ext_auth(struct mosquitto *mosq, void *obj, const char *auth_me
 		return MOSQ_ERR_AUTH;
 	}
 
-        
+        char *auth_data_cnt = NULL;
 
-	return MOSQ_ERR_SUCCESS;
+        ac_parse_auth_continue_payload((char *)auth_data, &auth_data_cnt);
+
+        // TODO parse the auth_data and check;
+        // if challenges are received, generate the responses and send them back
+        // if one challenge is received, generate the OTP and send it
+
+	return mosquitto_ext_auth_continue(mosq, auth_method, strlen(auth_data_cnt),
+					   auth_data_cnt, NULL);
 }
 
 static ac_stat ac_set_mosq_callbacks(struct mosquitto **mosq)

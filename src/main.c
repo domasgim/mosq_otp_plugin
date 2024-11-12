@@ -6,6 +6,8 @@
 #include <cotp.h>
 #include <cjson/cJSON.h>
 #include <sqlite3.h>
+#include <stdlib.h>
+#include <time.h>
 
 const char *g_secret = "my_awesome_secret";
 char *g_secret_base32 = NULL;
@@ -18,7 +20,7 @@ sqlite3 *g_db;
 
 typedef enum { AC_SUCCESS, AC_ERROR } ac_stat;
 
-#define DB_PATH	   "/tmp/mosq_otp_plugin.db"
+#define DB_PATH	   "/home/net-gimzunasdo/Stuff/baigiamasis/mosq_otp_plugin/mosq_otp_plugin.db"
 #define DB_TABLE   "REGISTERED_DEVICES"
 #define DB_TIMEOUT 5000
 // #define DB_CREATE_FMT                                                                                        \
@@ -71,14 +73,198 @@ static ac_stat parse_device_mac(char *json_str, char **out)
 	}
 }
 
+static ac_stat insert_device_challenge(int challenge, int device_id)
+{
+	sqlite3_stmt *stmt;
+	int rc;
+	rc = sqlite3_prepare_v2(g_db, DB_INSERT_CRP_FMT, -1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to prepare statement: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	rc = sqlite3_bind_int(stmt, 1, device_id);
+	if (rc != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind int: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	rc = sqlite3_bind_int(stmt, 2, challenge);
+	if (rc != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind int: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	// For now, the response is always 0, they will be updated later
+	rc = sqlite3_bind_int(stmt, 3, 0);
+	if (rc != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind int: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	rc = sqlite3_step(stmt);
+	if (rc != SQLITE_DONE) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to insert challenge: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	sqlite3_finalize(stmt);
+
+	mosquitto_log_printf(MOSQ_LOG_INFO, "Inserted challenge %d for device %d", challenge, device_id);
+
+	return AC_SUCCESS;
+}
+
+static ac_stat populate_auth_data_with_challenges(int challenges[], int challenges_len)
+{
+	// TODO
+	return AC_SUCCESS;
+}
+
+static ac_stat generate_json_response_str(int challenges[], int challenges_len, char **out)
+{
+	cJSON *json = cJSON_CreateObject();
+	cJSON *challenges_json = cJSON_CreateArray();
+
+	for (int i = 0; i < challenges_len; i++) {
+		cJSON_AddItemToArray(challenges_json, cJSON_CreateNumber(challenges[i]));
+	}
+
+	cJSON_AddItemToObject(json, "challenges", challenges_json);
+
+	*out = cJSON_PrintUnformatted(json);
+	cJSON_Delete(json);
+
+	return AC_SUCCESS;
+}
+
+// Generate 32 challenges for the device, insert them into the database and populate the auth_data field with them in form of a JSON array
+static ac_stat generate_device_challenges(char *device_mac, void **data_out, uint16_t *data_out_len)
+{
+	int challenge[32];
+	int rc = 0;
+
+	// Resolve the device ID from the given device MAC address
+	sqlite3_stmt *device_stmt;
+	int device_id = -1;
+	sqlite3_stmt *stmt;
+
+	rc = sqlite3_prepare_v2(g_db, "SELECT ID FROM Devices WHERE MAC = ?", -1, &device_stmt, NULL);
+	if (rc != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to prepare statement: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	rc = sqlite3_bind_text(device_stmt, 1, device_mac, -1, SQLITE_STATIC);
+	if (rc != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind text: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	rc = sqlite3_step(device_stmt);
+	if (rc == SQLITE_ROW) {
+		device_id = sqlite3_column_int(device_stmt, 0);
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Resolved device ID: %d", device_id);
+	} else {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to resolve device ID: %s", sqlite3_errmsg(g_db));
+		sqlite3_finalize(device_stmt);
+		return AC_ERROR;
+	}
+
+	sqlite3_finalize(device_stmt);
+
+	// rc = sqlite3_bind_int(stmt, 1, device_id);
+	// if (rc != SQLITE_OK) {
+	// 	mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind int: %s", sqlite3_errmsg(g_db));
+	// 	return AC_ERROR;
+	// }
+
+	// Generate 32 random challenges
+	for (int i = 0; i < 32; i++) {
+		challenge[i] = rand() % 256;
+		insert_device_challenge(challenge[i], device_id);
+	}
+
+	mosquitto_log_printf(MOSQ_LOG_INFO, "Generating response string...");
+
+	char* data_out_str = NULL;
+
+	// Generate a JSON array of the challenges
+	generate_json_response_str(challenge, 32, &data_out_str);
+
+	mosquitto_log_printf(MOSQ_LOG_INFO, "Generated challenges for device '%s'", (char *)data_out_str);
+
+	*data_out = data_out_str;
+	*data_out_len = strlen(data_out_str);
+
+	mosquitto_log_printf(MOSQ_LOG_INFO, "Data_out added");
+
+	// data_out_len = strlen((char *)data_out);
+
+	return AC_SUCCESS;
+}
+
+static ac_stat process_authenticating_device(char *device_mac, void **data_out, uint16_t *data_out_len)
+{
+	// Check if device is registered
+	sqlite3_stmt *stmt;
+	int rc;
+	rc = sqlite3_prepare_v2(g_db, DB_CHECK_DEVICE_FMT, -1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to prepare statement: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	rc = sqlite3_bind_text(stmt, 1, device_mac, -1, SQLITE_STATIC);
+	if (rc != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind text: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	rc = sqlite3_step(stmt);
+
+	if (rc == SQLITE_ROW) {
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Device '%s' found", device_mac);
+	} else if (rc == SQLITE_DONE) {
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Device '%s' not found", device_mac);
+		rc = sqlite3_prepare_v2(g_db, DB_INSERT_DEVICE_FMT, -1, &stmt, NULL);
+		if (rc != SQLITE_OK) {
+			mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to prepare statement: %s", sqlite3_errmsg(g_db));
+			return AC_ERROR;
+		}
+
+		rc = sqlite3_bind_text(stmt, 1, device_mac, -1, SQLITE_STATIC);
+		if (rc != SQLITE_OK) {
+			mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind text: %s", sqlite3_errmsg(g_db));
+			return AC_ERROR;
+		}
+
+		rc = sqlite3_step(stmt);
+		if (rc != SQLITE_DONE) {
+			mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to insert device: %s", sqlite3_errmsg(g_db));
+			return AC_ERROR;
+		}
+
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Device '%s' inserted", device_mac);
+
+		// TODO generate and insert challenges for the device
+		generate_device_challenges(device_mac, data_out, data_out_len);
+
+		// TODO send all the generated challenges to the device
+
+		// TODO receive responses from the device and update the database
+	} else {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to step: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	return AC_SUCCESS;
+}
+
 int auth_start_cb(int event, void *event_data, void *user_data)
 {
 	struct mosquitto_evt_extended_auth *ed = event_data;
-	char *auth_data = NULL;
-	char *out_data = "{\"hotp_counter\":2}";
-
-	// ed->data_out = strdup(out_data);
-	// ed->data_out_len = strlen(out_data);
+	char *device_mac = NULL;
 
 	if (ed->data_in_len > 0) {
 		mosquitto_log_printf(MOSQ_LOG_INFO, "Got some data of len %d: '%s'",
@@ -88,16 +274,19 @@ int auth_start_cb(int event, void *event_data, void *user_data)
 		return MOSQ_ERR_AUTH;
 	}
 
-	if (parse_device_mac((char *)ed->data_in, &auth_data) != AC_SUCCESS) {
+	if (parse_device_mac((char *)ed->data_in, &device_mac) != AC_SUCCESS) {
 		return MOSQ_ERR_AUTH;
 	}
 
-	mosquitto_log_printf(MOSQ_LOG_INFO, "Parsed device MAC: '%s'", auth_data);
+	mosquitto_log_printf(MOSQ_LOG_INFO, "Parsed device MAC: '%s'", device_mac);
 
-	mosquitto_log_printf(
-		MOSQ_LOG_INFO,
-		"%s:%d - event: %d, added authentication_data: '%s' (len %d)",
-		__FUNCTION__, __LINE__, event, out_data, ed->data_out_len);
+	// ed->data_out (void *)
+	// ed->data_out_len (uint16_t)
+	// 65,535 bytes out length
+	if (process_authenticating_device(device_mac, &ed->data_out, &ed->data_out_len) != AC_SUCCESS) {
+		return MOSQ_ERR_AUTH;
+	}
+
 	return MOSQ_ERR_AUTH_CONTINUE;
 }
 
@@ -200,6 +389,9 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata,
 		// TODO handle
 	}
 
+	// Initialize random seed
+	srand(time(NULL));
+
 	if (sqlite3_open(DB_PATH, &g_db)) {
 		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to open database '%s'", DB_PATH);
 		return MOSQ_ERR_CONN_REFUSED;
@@ -207,6 +399,7 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata,
 		mosquitto_log_printf(MOSQ_LOG_INFO, "Opened database '%s'", DB_PATH);
 	}
 
+	// Create tables if they don't exist
 	if (sqlite3_exec(g_db, DB_CREATE_DEVICES_FMT, NULL, NULL, &err_msg) != SQLITE_OK) {
 		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed creating device table error '%s'", err_msg);
 		sqlite3_free(err_msg);
@@ -219,6 +412,7 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata,
 		return MOSQ_ERR_CONN_REFUSED;
 	}
 
+	// Register callbacks
 	mosquitto_log_printf(MOSQ_LOG_INFO, "mosquitto_plugin_init %d",
 			     option_count);
 	mosquitto_callback_register(mosq_pid, MOSQ_EVT_EXT_AUTH_START,

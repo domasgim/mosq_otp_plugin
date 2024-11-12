@@ -2,8 +2,19 @@ from pypuf.simulation import XORArbiterPUF
 from pypuf.io import random_inputs
 import numpy as np
 import random
+import sys
 
-# challenges_new = [-1, 1, 1, 1, -1, -1, 1, 1]
+g_dbg = False
+
+def puf_log(msg):
+        if g_dbg:
+                print(msg)
+
+if __name__ == "__main__":
+    puf_log(f"Arguments count: {len(sys.argv)}")
+    for i, arg in enumerate(sys.argv):
+        puf_log(f"Argument {i:>6}: {arg}")
+
 
 def int_to_bit_array(num):
     # Ensure the number is within the 8-bit range (0 to 255)
@@ -17,7 +28,7 @@ def int_to_bit_array(num):
 
 # Example usage of pypuf bit converter
 # bit_array = int_to_bit_array(4)
-# print(bit_array)
+# puf_log(bit_array)
 
 # Generate random number
 # random.randint(0, 255)
@@ -25,12 +36,12 @@ def int_to_bit_array(num):
 puf = XORArbiterPUF(n=8, k=2, seed=3)
 # challenges = random_inputs(n=8, N=32, seed=3) # Pypuf challenges generator
 # challenges_new = np.array([[-1, 1, 1, 1, -1, -1, 1, 1],[1, 1, 1, -1, -1, 1, 1, 1]]) # Using custom byte arrays
-challenges_new = np.array([int_to_bit_array(2),int_to_bit_array(13)]) # Last iteration; easy way to create appropriate byte arrays for each challenge
-print(challenges_new)
+challenges_new = np.array([int_to_bit_array(int(arg)) for arg in sys.argv[1:]]) # Create appropriate byte arrays for each command line argument
+puf_log(challenges_new)
 resp = puf.eval(challenges_new)
-# print(challenges)
-print("RESPONSES:")
-print(resp)
+# puf_log(challenges)
+puf_log("RESPONSES:")
+puf_log(resp)
 
 
 # Generate a number from adding response bits (also converting pypuf bit format to regular format)
@@ -41,8 +52,9 @@ for resp_bit in resp:
                 resp_bit = 0
         else:
                 resp_bit = 1
-        # print("got a bit ", resp_bit)
+        # puf_log("got a bit ", resp_bit)
         out = (out << 1 ) | resp_bit
-        # print('{:032b}'.format(out))
+        # puf_log('{:032b}'.format(out))
 
+# Print all answers appended to each, intented to be a 32bit unsigned integer
 print(out)
