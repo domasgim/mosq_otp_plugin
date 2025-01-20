@@ -13,6 +13,7 @@
 const char *g_secret = "my_awesome_secret";
 char *g_secret_base32 = NULL;
 int g_counter = 2;
+int g_temporary_hotp_token = 0;
 
 // MOSQ_ERR_AUTH_CONTINUE
 static mosquitto_plugin_id_t *mosq_pid = NULL;
@@ -619,6 +620,8 @@ int auth_continue_cb(int event, void *event_data, void *user_data)
 
 			mosquitto_log_printf(MOSQ_LOG_INFO, "Generated a new challenge for device '%s', also immediately generated HOTP value %s", device_mac->valuestring, hotp_local);
 
+			g_temporary_hotp_token = atoi(hotp_local);
+
 			// Advanced tomfoolery, we basically want to save device mac and 32 challenge array until the next continue_cb invocation since this info will be reused when checking for HOTP vals
 			// Or we can just generate the HOTP token right at this moment and save it as user_data???? GENIUS
 			
@@ -634,6 +637,27 @@ int auth_continue_cb(int event, void *event_data, void *user_data)
 	// 2 means got the HOTP token from the device, now we need to check it
 	} else if (response_data->valueint == 2) {
 		// Got some data: '{"HOTP_TOKEN":"978088","REASON":2}'
+		// NOT FULLY IMPLEMENTED ATM
+		const cJSON *hotp_token = NULL;
+		hotp_token = cJSON_GetObjectItemCaseSensitive(parsed_response_json,
+								"HOTP_TOKEN");
+		if (cJSON_IsString(hotp_token) && (hotp_token->valuestring != NULL)) {
+			mosquitto_log_printf(MOSQ_LOG_INFO, "HOTP_TOKEN: '%s'", hotp_token->valuestring);
+
+			int hotp_token_int = atoi(hotp_token->valuestring);
+
+			if (hotp_token_int == g_temporary_hotp_token) {
+				mosquitto_log_printf(MOSQ_LOG_INFO, "HOTP tokens match, permitting...");
+				return MOSQ_ERR_SUCCESS;
+			} else {
+				mosquitto_log_printf(MOSQ_LOG_INFO, "HOTP tokens do not match, not permitting...");
+				return MOSQ_ERR_CONN_REFUSED;
+			}
+
+		} else {
+			mosquitto_log_printf(MOSQ_LOG_INFO, "Failed to find 'HOTP_TOKEN'!");
+			return MOSQ_ERR_CONN_REFUSED;
+		}
 	}else {
 		mosquitto_log_printf(MOSQ_LOG_INFO, "NOT IMPLENTED ATM with the response data: '%d'", response_data->valueint);
 	}
