@@ -49,7 +49,7 @@ int auth_continue_cb(int event, void *event_data, void *user_data)
 		ed->data_out_len);
 
 	if (ed->data_in_len > 0) {
-		mosquitto_log_printf(MOSQ_LOG_INFO, "Got some data: '%s'\n",
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Got some data: '%s'",
 				     ed->data_in);
 	}
 
@@ -59,7 +59,7 @@ int auth_continue_cb(int event, void *event_data, void *user_data)
 	if (parsed_hotp_json == NULL) {
 		const char *error_ptr = cJSON_GetErrorPtr();
 		if (error_ptr != NULL) {
-			mosquitto_log_printf(MOSQ_LOG_INFO, "Error before: %s\n", error_ptr);
+			mosquitto_log_printf(MOSQ_LOG_INFO, "Error before: %s", error_ptr);
 		}
 		// TODO handle err
 		return MOSQ_ERR_CONN_REFUSED;
@@ -68,9 +68,9 @@ int auth_continue_cb(int event, void *event_data, void *user_data)
 	hotp_value = cJSON_GetObjectItemCaseSensitive(parsed_hotp_json,
 							"hotp_value");
 	if (cJSON_IsString(hotp_value) && (hotp_value->valuestring != NULL)) {
-		mosquitto_log_printf(MOSQ_LOG_INFO, "hotp_value: '%s'\n", hotp_value->valuestring);
+		mosquitto_log_printf(MOSQ_LOG_INFO, "hotp_value: '%s'", hotp_value->valuestring);
 	} else {
-		mosquitto_log_printf(MOSQ_LOG_INFO, "Failed to find 'hotp_value'!\n");
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Failed to find 'hotp_value'!");
 		return MOSQ_ERR_CONN_REFUSED;
 	}
 
@@ -80,12 +80,12 @@ int auth_continue_cb(int event, void *event_data, void *user_data)
 		return MOSQ_ERR_CONN_REFUSED;
 	}
 
-	mosquitto_log_printf(MOSQ_LOG_INFO, "Checking HOTP tokens: got '%s', calculated '%s'\n", hotp_value->valuestring, hotp_local);
+	mosquitto_log_printf(MOSQ_LOG_INFO, "Checking HOTP tokens: got '%s', calculated '%s'", hotp_value->valuestring, hotp_local);
 	if (!strcmp(hotp_value->valuestring, hotp_local)) {
-		mosquitto_log_printf(MOSQ_LOG_INFO, "HOTP values match\n");
+		mosquitto_log_printf(MOSQ_LOG_INFO, "HOTP values match");
 		return MOSQ_ERR_SUCCESS;
 	} else {
-		mosquitto_log_printf(MOSQ_LOG_INFO, "HOTP values do not match, not permitting...\n");
+		mosquitto_log_printf(MOSQ_LOG_INFO, "HOTP values do not match, not permitting...");
 		return MOSQ_ERR_CONN_REFUSED;
 	}
 
