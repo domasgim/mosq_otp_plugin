@@ -305,7 +305,7 @@ int auth_start_cb(int event, void *event_data, void *user_data)
 
 int update_db_responses(char *response, char *device_mac)
 {
-	unsigned int crp_value = (unsigned int)strtoul(response, NULL, 10);
+	unsigned long long crp_value = strtoull(response, NULL, 10);
 	sqlite3_stmt *stmt;
 	int rc;
 
@@ -316,8 +316,17 @@ int update_db_responses(char *response, char *device_mac)
 		return AC_ERROR;
 	}
 
+	mosquitto_log_printf(MOSQ_LOG_INFO, "response %s | crp_value: %u", response, crp_value);
+	// Print the crp_value in binary representation
+	char binary_str[65];
 	for (int i = 0; i < 64; i++) {
-		int bit = (crp_value >> i) & 1;
+		binary_str[63 - i] = (crp_value & (1ULL << i)) ? '1' : '0';
+	}
+	binary_str[64] = '\0';
+	mosquitto_log_printf(MOSQ_LOG_INFO, "crp_value in binary: %s", binary_str);
+
+	for (int i = 0; i < 64; i++) {
+		int bit = (crp_value >> (63 - i)) & 1;
 		mosquitto_log_printf(MOSQ_LOG_INFO, "Bit %d: %d", i, bit);
 
 		// Bind the Response value
@@ -356,48 +365,173 @@ int update_db_responses(char *response, char *device_mac)
 		sqlite3_reset(stmt);
 	}
 
+	// mosquitto_log_printf(MOSQ_LOG_INFO, "KABOOM");
+	// exit(1);
+
 	sqlite3_finalize(stmt);
 	return AC_SUCCESS;
 }
 
-static ac_stat generate_challenge(const char *device_mac, void **data_out, uint16_t *data_out_len)
+static int append_CRPs(int challenges[], int challenges_len, const char *device_mac, char **out) 
 {
-	int challenge[32];
-	int rc = 0;
 
-	// Resolve the device ID from the given device MAC address
-	sqlite3_stmt *device_stmt;
-	int device_id = -1;
+	sqlite3_stmt *stmt;
+	int rc;
+	unsigned long response_value = 0;
 
-	rc = sqlite3_prepare_v2(g_db, "SELECT ID FROM Devices WHERE MAC = ?", -1, &device_stmt, NULL);
+	rc = sqlite3_prepare_v2(g_db, "SELECT Response FROM ChallengeResponsePairs WHERE DeviceID = (SELECT ID FROM Devices WHERE MAC = ?) AND Challenge = ?", -1, &stmt, NULL);
 	if (rc != SQLITE_OK) {
 		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to prepare statement: %s", sqlite3_errmsg(g_db));
 		return AC_ERROR;
 	}
 
-	rc = sqlite3_bind_text(device_stmt, 1, device_mac, -1, SQLITE_STATIC);
-	if (rc != SQLITE_OK) {
-		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind text: %s", sqlite3_errmsg(g_db));
-		return AC_ERROR;
+	for (int i = 0; i < 32; i++) {
+		rc = sqlite3_bind_text(stmt, 1, device_mac, -1, SQLITE_STATIC);
+		if (rc != SQLITE_OK) {
+			mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind text: %s", sqlite3_errmsg(g_db));
+			sqlite3_finalize(stmt);
+			return AC_ERROR;
+		}
+
+		// mosquitto_log_printf(MOSQ_LOG_INFO, "trying to bind int: %d-%d", 2, challenges[i]);
+		rc = sqlite3_bind_int(stmt, 2, challenges[i]);
+		if (rc != SQLITE_OK) {
+			mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind int: %s", sqlite3_errmsg(g_db));
+			sqlite3_finalize(stmt);
+			return AC_ERROR;
+		}
+
+		rc = sqlite3_step(stmt);
+		// fprintf(stdout, "Step result: %d\n", rc);
+		if (rc == SQLITE_ROW) {
+			int response_bit = sqlite3_column_int(stmt, 0);
+			response_value = (response_value << 1) | response_bit;
+			fprintf(stdout, "Challenge: %d | Response: %d | response_value: %lu\n", challenges[i], response_bit, response_value);
+			// Print the response_value in binary representation
+			char response_binary_str[33];
+			for (int j = 0; j < 32; j++) {
+				response_binary_str[31 - j] = (response_value & (1U << j)) ? '1' : '0';
+			}
+			response_binary_str[32] = '\0';
+			mosquitto_log_printf(MOSQ_LOG_INFO, "response_value in binary: %s", response_binary_str);
+
+		} else {
+			mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to step: %s", sqlite3_errmsg(g_db));
+			sqlite3_finalize(stmt);
+			return AC_ERROR;
+		}
+
+		sqlite3_reset(stmt);
 	}
 
-	rc = sqlite3_step(device_stmt);
-	if (rc == SQLITE_ROW) {
-		device_id = sqlite3_column_int(device_stmt, 0);
-		mosquitto_log_printf(MOSQ_LOG_INFO, "Resolved device ID: %d", device_id);
-	} else {
-		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to resolve device ID: %s", sqlite3_errmsg(g_db));
-		sqlite3_finalize(device_stmt);
-		return AC_ERROR;
-	}
+	sqlite3_finalize(stmt);
 
-	sqlite3_finalize(device_stmt);
+	fprintf(stdout, "Response value: %lu\n", response_value);
+
+	char response_str[64];
+	snprintf(response_str, sizeof(response_str), "%lu", response_value);
+	*out = strdup(response_str);
+	
+
+
+	// BAD
+
+	// rc = sqlite3_bind_text(stmt, 1, device_mac, -1, SQLITE_STATIC);
+	// if (rc != SQLITE_OK) {
+	// 	mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind text: %s", sqlite3_errmsg(g_db));
+	// 	sqlite3_finalize(stmt);
+	// 	return AC_ERROR;
+	// }
+
+	// int bit_position = 0;
+	// while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+	// 	int response_bit = sqlite3_column_int(stmt, 0);
+	// 	response_value |= (response_bit << bit_position);
+	// 	bit_position++;
+	// }
+
+	// if (rc != SQLITE_DONE) {
+	// 	mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to step: %s", sqlite3_errmsg(g_db));
+	// 	sqlite3_finalize(stmt);
+	// 	return AC_ERROR;
+	// }
+
+	// sqlite3_finalize(stmt);
+
+	// char response_str[33];
+	// snprintf(response_str, sizeof(response_str), "%u", response_value);
+	// *out = strdup(response_str);
+	return 0;
+}
+
+static ac_stat generate_challenge(const char *device_mac, void **data_out, uint16_t *data_out_len, char **hotp_local)
+{
+	int challenge[32];
+	int rc = 0;
+
+	// // Resolve the device ID from the given device MAC address
+	// sqlite3_stmt *device_stmt;
+	// int device_id = -1;
+
+	// rc = sqlite3_prepare_v2(g_db, "SELECT ID FROM Devices WHERE MAC = ?", -1, &device_stmt, NULL);
+	// if (rc != SQLITE_OK) {
+	// 	mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to prepare statement: %s", sqlite3_errmsg(g_db));
+	// 	return AC_ERROR;
+	// }
+
+	// rc = sqlite3_bind_text(device_stmt, 1, device_mac, -1, SQLITE_STATIC);
+	// if (rc != SQLITE_OK) {
+	// 	mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind text: %s", sqlite3_errmsg(g_db));
+	// 	return AC_ERROR;
+	// }
+
+	// rc = sqlite3_step(device_stmt);
+	// if (rc == SQLITE_ROW) {
+	// 	device_id = sqlite3_column_int(device_stmt, 0);
+	// 	mosquitto_log_printf(MOSQ_LOG_INFO, "Resolved device ID: %d", device_id);
+	// } else {
+	// 	mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to resolve device ID: %s", sqlite3_errmsg(g_db));
+	// 	sqlite3_finalize(device_stmt);
+	// 	return AC_ERROR;
+	// }
+
+	// sqlite3_finalize(device_stmt);
 
 	// Generate 32 random challenges
 	for (int i = 0; i < 32; i++) {
-		challenge[i] = rand() % 256;
-		insert_device_challenge(challenge[i], device_id);
+		// TODO update this
+		challenge[i] = rand() % 64;
+		// insert_device_challenge(challenge[i], device_id);
 	}
+
+	char *appended_crp = NULL;
+
+	if (append_CRPs(challenge, 32, device_mac, &appended_crp) != 0) {
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Failed to append CRPs");
+		return AC_ERROR;
+	}
+
+	cotp_error_t cotp_err;
+	char *hotp_local_local;
+	char *response_base32 = base32_encode((const uchar *)appended_crp,
+					strlen(appended_crp) + 1, &cotp_err);
+	if (cotp_err != 0) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Error: Could not encode response to base32");
+		return AC_ERROR;
+	}
+
+	mosquitto_log_printf(MOSQ_LOG_INFO, "HOTP params: %s / %s, %d, %d, %d", appended_crp, response_base32, 1, 6, SHA1);
+	
+	hotp_local_local = get_hotp(response_base32, 1, 6, SHA1, &cotp_err);
+	if (cotp_err != 0) {
+		// TODO handle err
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Error: Could not generate HOTP token, check parameters!");
+		return AC_ERROR;
+	}
+
+	mosquitto_log_printf(MOSQ_LOG_INFO, "Generated HOTP token: %s", hotp_local_local);
+
+	*hotp_local = strdup(hotp_local_local);
 
 	mosquitto_log_printf(MOSQ_LOG_INFO, "Generating response string...");
 
@@ -415,6 +549,8 @@ static ac_stat generate_challenge(const char *device_mac, void **data_out, uint1
 
 	return AC_SUCCESS;
 }
+
+
 
 int auth_continue_cb(int event, void *event_data, void *user_data)
 {
@@ -476,10 +612,17 @@ int auth_continue_cb(int event, void *event_data, void *user_data)
 
 			mosquitto_log_printf(MOSQ_LOG_INFO, "Updated the database with the responses, generating a new challenge...");
 			// Okay CRP is registered, send a subset of challenges to run a first HOTP check
-			if (generate_challenge(device_mac->valuestring, &ed->data_out, &ed->data_out_len) != AC_SUCCESS) {
+			if (generate_challenge(device_mac->valuestring, &ed->data_out, &ed->data_out_len, &hotp_local) != AC_SUCCESS) {
 				mosquitto_log_printf(MOSQ_LOG_INFO, "Failed to generate a new challenge");
 				return MOSQ_ERR_PROTOCOL;
 			}
+
+			mosquitto_log_printf(MOSQ_LOG_INFO, "Generated a new challenge for device '%s', also immediately generated HOTP value %s", device_mac->valuestring, hotp_local);
+
+			// Advanced tomfoolery, we basically want to save device mac and 32 challenge array until the next continue_cb invocation since this info will be reused when checking for HOTP vals
+			// Or we can just generate the HOTP token right at this moment and save it as user_data???? GENIUS
+			
+			
 
 			mosquitto_log_printf(MOSQ_LOG_INFO, "Generated a new challenge for device '%s'", device_mac->valuestring);
 
@@ -488,7 +631,10 @@ int auth_continue_cb(int event, void *event_data, void *user_data)
 			mosquitto_log_printf(MOSQ_LOG_INFO, "Failed to find 'CHALLENGE_RESPONSE'!");
 			return MOSQ_ERR_CONN_REFUSED;
 		}
-	} else {
+	// 2 means got the HOTP token from the device, now we need to check it
+	} else if (response_data->valueint == 2) {
+		// Got some data: '{"HOTP_TOKEN":"978088","REASON":2}'
+	}else {
 		mosquitto_log_printf(MOSQ_LOG_INFO, "NOT IMPLENTED ATM with the response data: '%d'", response_data->valueint);
 	}
 
