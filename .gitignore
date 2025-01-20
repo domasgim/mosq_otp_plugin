@@ -1,6 +1,7 @@
 build/
 CMakePresets.json
 mosquitto.conf
+.cache
 
 # Prerequisites
 *.d
