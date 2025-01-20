@@ -1,4 +1,5 @@
 #include <mosquitto.h>
+#include <mosquitto/broker.h>
 #include <mosquitto/defs.h>
 #include <mosquitto/libcommon_properties.h>
 #include <stdio.h>
@@ -20,7 +21,8 @@ sqlite3 *g_db;
 
 typedef enum { AC_SUCCESS, AC_ERROR } ac_stat;
 
-#define DB_PATH	   "/home/net-gimzunasdo/Stuff/baigiamasis/mosq_otp_plugin/mosq_otp_plugin.db"
+// #define DB_PATH	   "/home/net-gimzunasdo/Stuff/baigiamasis/mosq_otp_plugin/mosq_otp_plugin.db"
+#define DB_PATH	   "/home/domasgim/Desktop/baigiamasis_projektas/mosq_otp_plugin/mosq_otp_plugin.db"
 #define DB_TABLE   "REGISTERED_DEVICES"
 #define DB_TIMEOUT 5000
 // #define DB_CREATE_FMT                                                                                        \
@@ -121,7 +123,16 @@ static ac_stat populate_auth_data_with_challenges(int challenges[], int challeng
 	return AC_SUCCESS;
 }
 
-static ac_stat generate_json_response_str(int challenges[], int challenges_len, char **out)
+/**
+ * @brief Generate challenge payload to the client
+ * 
+ * @param challenges 
+ * @param challenges_len 
+ * @param out 
+ * @param reason 0 - registration process, 1 - authentication process
+ * @return ac_stat 
+ */
+static ac_stat generate_json_response_str(int challenges[], int challenges_len, char **out, int reason)
 {
 	cJSON *json = cJSON_CreateObject();
 	cJSON *challenges_json = cJSON_CreateArray();
@@ -130,7 +141,8 @@ static ac_stat generate_json_response_str(int challenges[], int challenges_len, 
 		cJSON_AddItemToArray(challenges_json, cJSON_CreateNumber(challenges[i]));
 	}
 
-	cJSON_AddItemToObject(json, "challenges", challenges_json);
+	cJSON_AddItemToObject(json, "CHALLENGES", challenges_json);
+	cJSON_AddItemToObject(json, "REASON", cJSON_CreateNumber(reason));
 
 	*out = cJSON_PrintUnformatted(json);
 	cJSON_Delete(json);
@@ -138,10 +150,10 @@ static ac_stat generate_json_response_str(int challenges[], int challenges_len, 
 	return AC_SUCCESS;
 }
 
-// Generate 32 challenges for the device, insert them into the database and populate the auth_data field with them in form of a JSON array
+// Generate 64 challenges for the device, insert them into the database and populate the auth_data field with them in form of a JSON array
 static ac_stat generate_device_challenges(char *device_mac, void **data_out, uint16_t *data_out_len)
 {
-	int challenge[32];
+	int challenge[64];
 	int rc = 0;
 
 	// Resolve the device ID from the given device MAC address
@@ -179,9 +191,10 @@ static ac_stat generate_device_challenges(char *device_mac, void **data_out, uin
 	// 	return AC_ERROR;
 	// }
 
-	// Generate 32 random challenges
-	for (int i = 0; i < 32; i++) {
-		challenge[i] = rand() % 256;
+	// Generate 64 random challenges
+	for (int i = 0; i < 64; i++) {
+		// challenge[i] = rand() % 256;
+		challenge[i] = i;
 		insert_device_challenge(challenge[i], device_id);
 	}
 
@@ -190,7 +203,7 @@ static ac_stat generate_device_challenges(char *device_mac, void **data_out, uin
 	char* data_out_str = NULL;
 
 	// Generate a JSON array of the challenges
-	generate_json_response_str(challenge, 32, &data_out_str);
+	generate_json_response_str(challenge, 64, &data_out_str, 0);
 
 	mosquitto_log_printf(MOSQ_LOG_INFO, "Generated challenges for device '%s'", (char *)data_out_str);
 
@@ -290,6 +303,119 @@ int auth_start_cb(int event, void *event_data, void *user_data)
 	return MOSQ_ERR_AUTH_CONTINUE;
 }
 
+int update_db_responses(char *response, char *device_mac)
+{
+	unsigned int crp_value = (unsigned int)strtoul(response, NULL, 10);
+	sqlite3_stmt *stmt;
+	int rc;
+
+	// Prepare the statement to update the Response column
+	rc = sqlite3_prepare_v2(g_db, "UPDATE ChallengeResponsePairs SET Response = ? WHERE DeviceID = (SELECT ID FROM Devices WHERE MAC = ?) AND Challenge = ?", -1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to prepare statement: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	for (int i = 0; i < 64; i++) {
+		int bit = (crp_value >> i) & 1;
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Bit %d: %d", i, bit);
+
+		// Bind the Response value
+		rc = sqlite3_bind_int(stmt, 1, bit);
+		if (rc != SQLITE_OK) {
+			mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind int: %s", sqlite3_errmsg(g_db));
+			sqlite3_finalize(stmt);
+			return AC_ERROR;
+		}
+
+		// Bind the Device MAC
+		rc = sqlite3_bind_text(stmt, 2, device_mac, -1, SQLITE_STATIC);
+		if (rc != SQLITE_OK) {
+			mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind text: %s", sqlite3_errmsg(g_db));
+			sqlite3_finalize(stmt);
+			return AC_ERROR;
+		}
+
+		// Bind the Challenge value
+		rc = sqlite3_bind_int(stmt, 3, i);
+		if (rc != SQLITE_OK) {
+			mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind int: %s", sqlite3_errmsg(g_db));
+			sqlite3_finalize(stmt);
+			return AC_ERROR;
+		}
+
+		// Execute the update statement
+		rc = sqlite3_step(stmt);
+		if (rc != SQLITE_DONE) {
+			mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to update response: %s", sqlite3_errmsg(g_db));
+			sqlite3_finalize(stmt);
+			return AC_ERROR;
+		}
+
+		// Reset the statement to be reused
+		sqlite3_reset(stmt);
+	}
+
+	sqlite3_finalize(stmt);
+	return AC_SUCCESS;
+}
+
+static ac_stat generate_challenge(const char *device_mac, void **data_out, uint16_t *data_out_len)
+{
+	int challenge[32];
+	int rc = 0;
+
+	// Resolve the device ID from the given device MAC address
+	sqlite3_stmt *device_stmt;
+	int device_id = -1;
+
+	rc = sqlite3_prepare_v2(g_db, "SELECT ID FROM Devices WHERE MAC = ?", -1, &device_stmt, NULL);
+	if (rc != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to prepare statement: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	rc = sqlite3_bind_text(device_stmt, 1, device_mac, -1, SQLITE_STATIC);
+	if (rc != SQLITE_OK) {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to bind text: %s", sqlite3_errmsg(g_db));
+		return AC_ERROR;
+	}
+
+	rc = sqlite3_step(device_stmt);
+	if (rc == SQLITE_ROW) {
+		device_id = sqlite3_column_int(device_stmt, 0);
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Resolved device ID: %d", device_id);
+	} else {
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to resolve device ID: %s", sqlite3_errmsg(g_db));
+		sqlite3_finalize(device_stmt);
+		return AC_ERROR;
+	}
+
+	sqlite3_finalize(device_stmt);
+
+	// Generate 32 random challenges
+	for (int i = 0; i < 32; i++) {
+		challenge[i] = rand() % 256;
+		insert_device_challenge(challenge[i], device_id);
+	}
+
+	mosquitto_log_printf(MOSQ_LOG_INFO, "Generating response string...");
+
+	char* data_out_str = NULL;
+
+	// Generate a JSON array of the challenges
+	generate_json_response_str(challenge, 32, &data_out_str, 1);
+
+	mosquitto_log_printf(MOSQ_LOG_INFO, "Generated challenges for device '%s'", (char *)data_out_str);
+
+	*data_out = data_out_str;
+	*data_out_len = strlen(data_out_str);
+
+	mosquitto_log_printf(MOSQ_LOG_INFO, "Data_out added");
+
+	return AC_SUCCESS;
+}
+
 int auth_continue_cb(int event, void *event_data, void *user_data)
 {
 	struct mosquitto_evt_extended_auth *ed = event_data;
@@ -298,6 +424,9 @@ int auth_continue_cb(int event, void *event_data, void *user_data)
 	char *hotp_local;
 	cotp_error_t cotp_err;
 	uint16_t auth_data_len = 0;
+	const cJSON *response_data = NULL;
+	const cJSON *CRP_result = NULL;
+	const cJSON *device_mac = NULL;
 
 	mosquitto_log_printf(
 		MOSQ_LOG_INFO,
@@ -310,6 +439,67 @@ int auth_continue_cb(int event, void *event_data, void *user_data)
 				     ed->data_in);
 	}
 
+	cJSON *parsed_response_json = cJSON_Parse(ed->data_in);
+	if (parsed_response_json == NULL) {
+		const char *error_ptr = cJSON_GetErrorPtr();
+		if (error_ptr != NULL) {
+			mosquitto_log_printf(MOSQ_LOG_INFO, "Error before: %s", error_ptr);
+		}
+		// TODO handle err
+		return MOSQ_ERR_CONN_REFUSED;
+	}
+
+	response_data = cJSON_GetObjectItemCaseSensitive(parsed_response_json,
+							"REASON");
+	
+	if (cJSON_IsNumber(response_data) && (response_data->valueint != 0)) {
+		mosquitto_log_printf(MOSQ_LOG_INFO, "REASON: '%d'", response_data->valueint);
+	} else {
+		mosquitto_log_printf(MOSQ_LOG_INFO, "Failed to find 'REASON'!");
+		return MOSQ_ERR_CONN_REFUSED;
+	}
+
+	// 1 means got the reponse payload from CRP step, now we parse it and insert it into the database
+	if (response_data->valueint == 1) {
+		// ATM the response pair is a single 64bit number in form of a JSON string with key CHALLENGE_RESPOSNE, each bit will be a response to n-th challenge
+		CRP_result = cJSON_GetObjectItemCaseSensitive(parsed_response_json,
+								"CHALLENGE_RESPONSE");
+		
+		device_mac = cJSON_GetObjectItemCaseSensitive(parsed_response_json,
+								"DEVICE_MAC");
+
+		if (cJSON_IsString(CRP_result) && (CRP_result->valuestring != NULL) && cJSON_IsString(device_mac) && (device_mac->valuestring != NULL)) {
+			mosquitto_log_printf(MOSQ_LOG_INFO, "CHALLENGE_RESPONSE: '%s' | DEVICE_MAC: '%s'", CRP_result->valuestring, device_mac->valuestring);
+
+			// Update the database..
+			update_db_responses(CRP_result->valuestring, device_mac->valuestring);
+
+			mosquitto_log_printf(MOSQ_LOG_INFO, "Updated the database with the responses, generating a new challenge...");
+			// Okay CRP is registered, send a subset of challenges to run a first HOTP check
+			if (generate_challenge(device_mac->valuestring, &ed->data_out, &ed->data_out_len) != AC_SUCCESS) {
+				mosquitto_log_printf(MOSQ_LOG_INFO, "Failed to generate a new challenge");
+				return MOSQ_ERR_PROTOCOL;
+			}
+
+			mosquitto_log_printf(MOSQ_LOG_INFO, "Generated a new challenge for device '%s'", device_mac->valuestring);
+
+			return MOSQ_ERR_AUTH_CONTINUE;
+		} else {
+			mosquitto_log_printf(MOSQ_LOG_INFO, "Failed to find 'CHALLENGE_RESPONSE'!");
+			return MOSQ_ERR_CONN_REFUSED;
+		}
+	} else {
+		mosquitto_log_printf(MOSQ_LOG_INFO, "NOT IMPLENTED ATM with the response data: '%d'", response_data->valueint);
+	}
+
+
+
+
+
+
+	// !!!!! Everything below is OLD !!!!!
+	/** 
+
 	// TODO: extract hotp_value and calculate it with your own value, compare and permit accordingly
 	const cJSON *hotp_value = NULL;
 	cJSON *parsed_hotp_json = cJSON_Parse(ed->data_in);
@@ -321,6 +511,9 @@ int auth_continue_cb(int event, void *event_data, void *user_data)
 		// TODO handle err
 		return MOSQ_ERR_CONN_REFUSED;
 	}
+
+	// TODO try to extract REASON value first to determine if we need to continue with something else
+
 
 	hotp_value = cJSON_GetObjectItemCaseSensitive(parsed_hotp_json,
 							"hotp_value");
@@ -347,6 +540,7 @@ int auth_continue_cb(int event, void *event_data, void *user_data)
 	}
 
 	return MOSQ_ERR_SUCCESS;
+	*/
 }
 
 int mosquitto_plugin_version(int supported_version_count,

@@ -2,6 +2,29 @@
 
 TODO
 
+## Cheat sheet
+
+* The mosquitto commands such as `mosquitto_pub` do not support AUTH properties, use your own clients, also `release` version of mosquitto does not support some extended auth features as of time of writing, this means you need to compile your own mosquitto library from `develop` branch!
+
+* Make sure these paths are correct
+
+```
+#define PUF_SCRIPT_PATH
+#define DB_PATH
+```
+
+ATM the only thing that is implemented is non-registered client authentication using HOTP. This means to showcase the same client authentication the DB needs to be flushed every time.
+
+```
+sqlite3 ./mosq_otp_plugin.db --box 'DELETE FROM Devices'
+sqlite3 ./mosq_otp_plugin.db --box 'SELECT * FROM Devices'
+sqlite3 ./mosq_otp_plugin.db --box 'DELETE FROM ChallengeResponsePairs'
+sqlite3 ./mosq_otp_plugin.db --box 'SELECT * FROM ChallengeResponsePairs'
+
+## or just...
+sqlite3 ./mosq_otp_plugin.db --box 'DELETE FROM Devices' && sqlite3 ./mosq_otp_plugin.db --box 'DELETE FROM ChallengeResponsePairs' && mosquitto -c ./mosquitto.conf
+```
+
 ## Sample commands
 
 The mosquitto commands such as mosquitto_pub do not support AUTH properties!
